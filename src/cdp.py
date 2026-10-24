@@ -12,6 +12,9 @@
 
 import json
 import os
+import platform
+import socket
+import subprocess
 import sys
 import time
 import urllib.request
@@ -36,13 +39,158 @@ class CdpError(RuntimeError):
     tkinter 会把回调里的 SystemExit 原样抛出，直接结束 mainloop（表现就是闪退）。"""
 
 
-def targets():
+_NO_WIN = 0x08000000  # CREATE_NO_WINDOW：别在用户面前闪黑框
+
+
+def _port_listening(port=None):
+    """端口上到底有没有人在听。比直接 HTTP 更快，也不受代理影响。"""
+    port = port or PORT
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.8)
     try:
-        with _OPENER.open(f"http://127.0.0.1:{PORT}/json", timeout=3) as r:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def port_owner(port=None):
+    """谁在监听这个端口，返回 'xxx.exe (PID 1234)'；查不到返回空串。"""
+    port = port or PORT
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True,
+                             timeout=8, creationflags=_NO_WIN).stdout.decode("gbk", "ignore")
+    except Exception:
+        return ""
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) >= 5 and p[1].endswith(":%d" % port) and p[3].upper() == "LISTENING":
+            pid = p[4]
+            try:
+                t = subprocess.run(["tasklist", "/FI", "PID eq %s" % pid], capture_output=True,
+                                   timeout=8, creationflags=_NO_WIN).stdout.decode("gbk", "ignore")
+                for l2 in t.splitlines():
+                    if l2.strip().startswith("QuestAway") or ".exe" in l2:
+                        name = l2.split()[0]
+                        if name.lower() != "映像名称" and name.lower() != "image":
+                            return f"{name} (PID {pid})"
+            except Exception:
+                pass
+            return f"PID {pid}"
+    return ""
+
+
+def _proc_running(name):
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq %s" % name], capture_output=True,
+                             timeout=8, creationflags=_NO_WIN).stdout.decode("gbk", "ignore")
+        return name.lower() in out.lower()
+    except Exception:
+        return False
+
+
+def _proc_count(name):
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq %s" % name], capture_output=True,
+                             timeout=8, creationflags=_NO_WIN).stdout.decode("gbk", "ignore")
+        return sum(1 for l in out.splitlines() if name.lower() in l.lower())
+    except Exception:
+        return 0
+
+
+def webview2_version():
+    """WebView2 Runtime 版本。Win11 自带，Win10 要靠 Edge 带装或单独装。"""
+    try:
+        import winreg
+    except Exception:
+        return "读不到（非 Windows）"
+    paths = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\EdgeUpdate\Clients"),
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\EdgeUpdate\Clients"),
+    ]
+    for root, path in paths:
+        try:
+            k = winreg.OpenKey(root, path)
+        except OSError:
+            continue
+        try:
+            n = winreg.QueryInfoKey(k)[0]
+        except Exception:
+            continue
+        for i in range(n):
+            try:
+                sub = winreg.OpenKey(k, winreg.EnumKey(k, i))
+                name = str(winreg.QueryValueEx(sub, "name")[0])
+                if "WebView2" in name:
+                    return "%s %s" % (name, winreg.QueryValueEx(sub, "pv")[0])
+            except Exception:
+                continue
+    return "没装（Win10 常见，去微软官网下 Evergreen 运行时）"
+
+
+def _why_no_port(err):
+    """把「连不上」翻译成能直接照着做的结论。"""
+    if _port_listening():
+        who = port_owner() or "未知程序"
+        return ("127.0.0.1:%d 有程序在监听，但不是游戏的调试端口：%s\n"
+                "这个端口被别的软件占了，游戏就开不出调试端口。\n"
+                "把占用它的程序关掉，再重新「一键启动游戏」。\n"
+                "（原始错误：%s）" % (PORT, who, err))
+    return ("127.0.0.1:%d 上没有任何程序在监听 —— 游戏的调试端口没开。\n"
+            "按顺序自查：\n"
+            "1. 游戏必须用助手的「一键启动游戏」拉起；直接开 Steam、双击桌面图标都不会带调试端口\n"
+            "2. 启动前要完全退出游戏（任务管理器里不能还有 QuestAway.exe）\n"
+            "3. 冷启动可能要十几秒到一分钟，多等一会儿再点「连接」\n"
+            "（原始错误：%s）" % (PORT, err))
+
+
+def targets(timeout=5):
+    try:
+        with _OPENER.open(f"http://127.0.0.1:{PORT}/json", timeout=timeout) as r:
             return json.load(r)
     except Exception as e:
-        raise CdpError(f"连不上 127.0.0.1:{PORT}（{e}）\n"
-                       "游戏必须用助手里的「一键启动游戏」拉起，或用带调试端口的方式启动。")
+        raise CdpError(_why_no_port(e))
+
+
+def diagnose(game_exe=""):
+    """连不上时把现场信息一次性摊开，用户复制发给作者就能定位。"""
+    out = ["—— 诊断 ——"]
+    try:
+        out.append("时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        out.append("系统：%s" % platform.platform())
+    except Exception:
+        pass
+    out.append("游戏 exe：%s" % (game_exe or "未设置"))
+    out.append("WebView2 Runtime：%s" % webview2_version())
+
+    living = _port_listening()
+    out.append("端口 %d 有程序监听：%s" % (PORT, "是" if living else "否"))
+    if living:
+        out.append("监听者：%s" % (port_owner() or "查不到（试试以管理员运行）"))
+        try:
+            ts = targets(timeout=3)
+            out.append("调试页面 %d 个：" % len(ts))
+            for t in ts:
+                out.append("  · [%s] %s %s" % (t.get("type"), t.get("url"), t.get("title") or ""))
+        except Exception as e:
+            out.append("读 /json 失败：%s" % e)
+    else:
+        out.append("QuestAway.exe 在运行：%s" % ("是" if _proc_running("QuestAway.exe") else "否"))
+        n = _proc_count("msedgewebview2.exe")
+        out.append("msedgewebview2.exe 进程数：%d" % n)
+        out.append("→ 端口没开：游戏启动时没带上调试参数，或者还没启动完")
+        if n:
+            out.append("  机器上已经有一批 WebView2 进程。WebView2 是按「用户数据目录」"
+                       "单例的，旧的进程组还活着时，新启动的游戏会直接复用它，\n"
+                       "  此时调试端口参数会被忽略 —— 这是「明明用助手启动的却连不上」的常见原因。\n"
+                       "  最省事的解法：重启一次电脑，再打开助手「一键启动游戏」。")
+    out.append("—— 诊断结束 ——")
+    return "\n".join(out)
 
 
 def _rank(t):
@@ -77,7 +225,7 @@ def is_game_page(info):
     return bool(info.get("winlayer")) or (info.get("slots") or 0) >= 20
 
 
-def pick_game(max_try=8):
+def pick_game(max_try=8, render_wait=0.0):
     """挑「真正的游戏主界面」，返回 (CDP, info, target)。
 
     9222 上一般有两个 page：主界面 `http://tauri.localhost/` 和
@@ -85,6 +233,10 @@ def pick_game(max_try=8):
     但只有主界面有 #winlayer / .slot。以前只按 URL 排序就选第一个，
     主界面还没加载完时会连到日志页 —— 表现正是「显示已连接，但所有
     功能都没反应」（scan 全是空，而空结果不报错，于是一直错下去）。
+
+    render_wait > 0 时，主页面 DOM 还没长出来（格子数 0）会再等几轮，
+    因为游戏是单页应用，格子是 JS 生成的，刚起来那一两秒必然是 0。
+    不等的话，冷启动慢的机器会被误判成「没找到游戏主界面」。
     """
     ts = [t for t in targets() if t.get("type") == "page"]
     if not ts:
@@ -107,6 +259,15 @@ def pick_game(max_try=8):
             continue
         if is_game_page(info):
             return c, info, t
+        if render_wait > 0 and _rank(t) == 0:
+            for _ in range(2):
+                time.sleep(render_wait)
+                try:
+                    info = c.eval(IS_GAME_JS) or {}
+                except Exception:
+                    break
+                if is_game_page(info):
+                    return c, info, t
         c.close()
         seen.append(f'{url}：不是游戏界面（格子 {info.get("slots", 0)}、'
                     f'动作 {info.get("actions", 0)}、窗口层 {info.get("winlayer")}）')

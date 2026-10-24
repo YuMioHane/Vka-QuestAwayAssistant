@@ -224,12 +224,29 @@ def right_click_item(c, it, want=("inv", "stash")):
 
 
 class Engine:
-    def __init__(self, log):
+    def __init__(self, log, dbg=None):
         self.log = log
+        self._dbg = dbg
         self.stop = threading.Event()
         self.c = None
         self.page_info = {}
+        self.action = "空闲"
+        self._last_scan = None
         self.stat = {"switches": 0, "chests": 0, "crafts": 0, "stored": 0}
+
+    def dbg(self, msg):
+        """详细日志：只进调试窗口，不进主界面（那边留给人看的关键行）。"""
+        if not self._dbg:
+            return
+        try:
+            self._dbg(msg)
+        except Exception:
+            pass
+
+    def doing(self, what):
+        """记录当前在干什么，调试窗口会实时显示。"""
+        self.action = what
+        self.dbg(f"动作 → {what}")
 
     def ui_flags(self):
         s = self.scan()
@@ -260,18 +277,25 @@ class Engine:
     def connect(self):
         if self.c:
             return self.c
-        c, info, t = cdp.pick_game()
+        # render_wait：游戏是单页应用，刚启动那一两秒格子还没生成，
+        # 不等待就会被误判成「不是游戏界面」。
+        t0 = time.time()
+        c, info, t = cdp.pick_game(render_wait=0.8)
         self.c = c
         self.page_info = info
         self.log(f"已连接游戏主界面：{info.get('href') or t.get('url')}"
                  f"（页面格子 {info.get('slots', 0)} 个）")
+        self.dbg("连接成功，用时 %.2f 秒｜target=%s｜标题=%s｜格子=%s｜动作=%s" % (
+            time.time() - t0, t.get("url"), info.get("title"),
+            info.get("slots"), info.get("actions")))
         return self.c
 
     def alive(self):
         try:
             self.connect().eval("1")
             return True
-        except Exception:
+        except Exception as e:
+            self.dbg(f"心跳失败，断开重连：{e}")
             self.c = None
             return False
 
@@ -285,7 +309,19 @@ class Engine:
             except Exception:
                 pass
             self.c = None
+            self.dbg("扫描结果里没有窗口层也没有格子 → 判定不是游戏主界面，已断开")
             raise cdp.CdpError("当前连接的不是游戏主界面，已断开，稍后自动重连")
+        # 只在内容变化时记一行，挂机时不至于把调试日志刷爆
+        brief = (len(s["bagItems"]), len(s["stashItems"]),
+                 len(s["bagMats"]), len(s["stashMats"]),
+                 bool(s["hasBag"]), bool(s["hasBench"]), bool(s["hasStash"]))
+        if brief != self._last_scan:
+            self._last_scan = brief
+            self.dbg("扫描：背包 %d 件 / %d 堆材料，仓库 %d 件 / %d 堆材料；"
+                     "窗口 背包=%s 工作台=%s 仓库=%s；立方体 %d/%d" % (
+                         brief[0], brief[2], brief[1], brief[3],
+                         brief[4], brief[5], brief[6],
+                         s.get("cubeFilled", 0), len(s.get("cube") or [])))
         return s
 
     def ensure_ui(self, bag=True, bench=False, stash=False):
@@ -308,10 +344,12 @@ class Engine:
     # ---------- 1 换图 ----------
     def switch_stage(self, target):
         c = self.connect()
+        self.doing(f"换图 → {target}")
         cdp.act(c, "mapstage", target)
         time.sleep(0.35)
         self.stat["switches"] += 1
         self.log(f"换图 → {target}")
+        self.action = "空闲"
         return True
 
     # ---------- 2 收箱 ----------
@@ -321,6 +359,7 @@ class Engine:
         pending = [x for x in cs if x["visible"]]
         if not pending:
             return 0
+        self.doing("收箱：%d 个待开" % len(pending))
         opened, failed = [], []
         for x in pending:
             name = cdp.KIND_ZH.get(x["kind"], x["kind"] or "空槽")
@@ -335,6 +374,7 @@ class Engine:
             self.log("收箱：" + "、".join(opened))
         if failed:
             self.log("没开掉：" + "、".join(failed))
+        self.action = "空闲"
         return len(opened)
 
     # ---------- 3 转化（右键做种 + 自动填入，全流程不拖拽） ----------
@@ -499,14 +539,16 @@ class Engine:
 
     # ---------- 5 分解 ----------
     def dismantle(self, rarities=None, kind="item", limit=8, bag_only=False):
-        before_ui = None
         """分解：工位切到「分解」，右键放物品/材料，再点 ♻ 分解。
 
         和转化一样：仓库候选先取回背包，放不满不点按钮。
         """
+        rarities = rarities or []
+        self.doing("分解：" + ("材料" if kind == "mat" else
+                               ("、".join(dict(RARITY).get(k, k) for k in rarities) or "未选品阶"))
+                   + ("（只背包）" if bag_only else ""))
         c = self.connect()
         before_ui = self.ui_flags()
-        rarities = rarities or []
         if kind == "item" and not rarities:
             self.log("分解跳过：没勾稀有度")
             return False
@@ -622,6 +664,7 @@ class Engine:
         return done > 0
 
     def craft(self, mode="equipment", rarities=None, mats=None):
+        self.doing("转化：" + {"material": "材料", "both": "材料+装备"}.get(mode, "装备"))
         if mode == "material":
             return self.craft_materials(mats)
         if mode == "both":
@@ -634,6 +677,8 @@ class Engine:
 
         搬运前必须先关工作台：合成面板开着会抢右键，物品容易被丢进立方体。
         """
+        self.doing("取回：" + ("不限品阶" if not rarities
+                               else "、".join(dict(RARITY).get(k, k) for k in rarities)))
         c = self.connect()
         s = self.scan()
         if s["hasBench"]:
@@ -681,12 +726,14 @@ class Engine:
         return moved
 
     def store(self, rarities, limit=60, include_mats=True):
-        before_ui = self.ui_flags()
         """对背包物品右键直接存入仓库。
 
         不用拖拽：拖拽有落点风险，合成面板开着时可能把物品丢进立方体。
         右键是游戏自带的「直接存入」，不依赖任何落点。
         """
+        self.doing("存仓：" + ("、".join(dict(RARITY).get(k, k) for k in rarities) or "不限")
+                   + ("（含材料）" if include_mats else ""))
+        before_ui = self.ui_flags()
         c = self.connect()
         s = self.scan()
         if s["hasBench"]:
@@ -726,6 +773,174 @@ class Engine:
         return moved
 
 
+class DebugWindow(tk.Toplevel):
+    """独立调试窗口：当前状态 / 连接信息 / 详细日志。
+
+    主界面的日志框只留人看的关键行；这里保留全部细节（带毫秒时间戳）。
+    出问题时点「复制全部」，把状态和日志一起发给作者就能定位。
+
+    线程安全：后台线程只写 self._conn_result，由 _tick 在主线程取走，
+    绝不从别的线程碰控件。
+    """
+
+    ROWS = ("连接", "当前动作", "统计", "页面", "端口", "WebView2", "游戏进程")
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("QuestAway 助手 · 调试信息")
+        self.geometry("780x640")
+        self.configure(bg="#ffffff")
+        self.attributes("-topmost", True)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+        self._tick_id = None
+        self._conn_busy = False
+        self._conn_result = None
+
+        st = ttk.LabelFrame(self, text=" 当前状态 ", padding=8)
+        st.pack(fill="x", padx=10, pady=(10, 0))
+        st.columnconfigure(1, weight=1)
+        self.vars = {}
+        for i, name in enumerate(self.ROWS):
+            ttk.Label(st, text=name + "：", foreground="#495057").grid(
+                row=i, column=0, sticky="nw")
+            v = tk.StringVar(value="—")
+            self.vars[name] = v
+            ttk.Label(st, textvariable=v, foreground="#212529", wraplength=620,
+                      justify="left").grid(row=i, column=1, sticky="w", padx=(2, 0))
+
+        lg = ttk.LabelFrame(self, text=" 详细日志 ", padding=6)
+        lg.pack(fill="both", expand=True, padx=10, pady=(8, 6))
+        self.txt = tk.Text(lg, wrap="word", font=("Consolas", 9),
+                           background="#fbfcfe", borderwidth=0)
+        sb = ttk.Scrollbar(lg, command=self.txt.yview)
+        self.txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.txt.pack(fill="both", expand=True)
+
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(bar, text="刷新连接信息", command=self.refresh_conn).pack(side="left")
+        ttk.Button(bar, text="复制全部", command=self.copy_all).pack(side="left", padx=6)
+        ttk.Button(bar, text="清空日志", command=self.clear).pack(side="left")
+        ttk.Button(bar, text="关闭", command=self.close).pack(side="right")
+
+        self._tick()
+        self.refresh_conn()
+
+    # ---------- 状态 ----------
+    def _alive(self):
+        try:
+            return bool(self.winfo_exists())
+        except Exception:
+            return False
+
+    def _tick(self):
+        if not self._alive():
+            return
+        try:
+            self._update_state()
+            # 后台查回来的连接信息，在这里回填（不跨线程碰控件）
+            r = self._conn_result
+            if r:
+                self._conn_result = None
+                self._conn_busy = False
+                self.vars["端口"].set(r[0])
+                self.vars["WebView2"].set(r[1])
+                self.vars["游戏进程"].set(r[2])
+                self.app.dbg_put("[连接信息] 端口=%s｜WebView2=%s｜游戏进程=%s" % r)
+        except Exception as e:
+            self.append(f"[调试窗口] 刷新状态出错：{e}")
+        self._tick_id = self.after(1000, self._tick)
+
+    def _update_state(self):
+        e = self.app.engine
+        info = e.page_info or {}
+        if e.c:
+            self.vars["连接"].set("已连接 · 页面格子 %s 个" % info.get("slots", 0))
+        elif getattr(self.app, "_probing", False):
+            self.vars["连接"].set("未连接（正在自动重试…）")
+        else:
+            self.vars["连接"].set("未连接")
+        self.vars["当前动作"].set(e.action or "空闲")
+        s = e.stat
+        self.vars["统计"].set("换关 %d · 收箱 %d · 转化 %d · 存仓 %d" % (
+            s["switches"], s["chests"], s["crafts"], s["stored"]))
+        self.vars["页面"].set(info.get("href") or "—")
+
+    def refresh_conn(self):
+        """端口 / WebView2 / 游戏进程要跑 tasklist，放后台查，别卡界面。"""
+        if self._conn_busy:
+            return
+        self._conn_busy = True
+        self._conn_result = None
+        for k in ("端口", "WebView2", "游戏进程"):
+            self.vars[k].set("查询中…")
+
+        def work():
+            try:
+                if cdp._port_listening():
+                    port = "%d 监听中 · %s" % (cdp.PORT, cdp.port_owner() or "查不到占用者")
+                else:
+                    port = "%d 没有程序监听（调试端口没开）" % cdp.PORT
+            except Exception as ex:
+                port = "查询失败：%s" % ex
+            try:
+                wv = cdp.webview2_version()
+            except Exception:
+                wv = "查不到"
+            try:
+                run = "运行中" if cdp._proc_running("QuestAway.exe") else "未运行"
+            except Exception:
+                run = "查不到"
+            self._conn_result = (port, wv, run)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- 日志 ----------
+    def append(self, msg):
+        if not self._alive():
+            return
+        self.txt.config(state="normal")
+        self.txt.insert("end", str(msg).rstrip("\n") + "\n")
+        try:
+            total = int(self.txt.index("end-1c").split(".")[0])
+            if total > 3000:  # 挂机一整晚也不至于把内存吃光
+                self.txt.delete("1.0", "%d.0" % (total - 3000))
+        except Exception:
+            pass
+        self.txt.see("end")
+        self.txt.config(state="disabled")
+
+    def clear(self):
+        self.txt.config(state="normal")
+        self.txt.delete("1.0", "end")
+        self.txt.config(state="disabled")
+
+    def copy_all(self):
+        try:
+            head = "\n".join("%s：%s" % (k, self.vars[k].get()) for k in self.ROWS)
+            body = self.txt.get("1.0", "end-1c")
+            self.clipboard_clear()
+            self.clipboard_append(head + "\n\n—— 详细日志 ——\n" + body)
+            messagebox.showinfo("已复制", "状态和日志都已复制到剪贴板。", parent=self)
+        except Exception as e:
+            messagebox.showerror("复制失败", str(e), parent=self)
+
+    def close(self):
+        try:
+            if self._tick_id:
+                self.after_cancel(self._tick_id)
+        except Exception:
+            pass
+        try:
+            self.app.dbg_win = None
+        except Exception:
+            pass
+        self.destroy()
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -736,11 +951,14 @@ class App(tk.Tk):
         self.attributes("-topmost", True)
         self.cfg = load_cfg()
         self.q = queue.Queue()
-        self.engine = Engine(self.q.put)
+        self.dq = queue.Queue(maxsize=4000)   # 调试窗口的详细日志（限量，防吃内存）
+        self.dbg_win = None
+        self.engine = Engine(self.q.put, self.dbg_put)
         self.worker = None
         self.snapshot = {}
         self._warned = False
         self._syncing = False
+        self._probing = False
         self._build()
         self._refresh_cfg()
         for k in self.store_vars:
@@ -831,6 +1049,7 @@ class App(tk.Tk):
         head = ttk.Frame(self)
         head.pack(fill="x", **pad)
         ttk.Label(head, text="QuestAway 助手", font=("Microsoft YaHei UI", 13, "bold")).pack(side="left")
+        ttk.Button(head, text="调试", command=self.open_debug).pack(side="right", padx=(6, 0))
         self.lbl = ttk.Label(head, text="未连接", foreground="#8b93a1")
         self.lbl.pack(side="right")
 
@@ -1201,27 +1420,118 @@ class App(tk.Tk):
                 log_error("launch_game: " + err)
                 messagebox.showerror("启动失败", err)
                 return
-            self.q.put("已启动游戏，等它出现窗口…")
-            self.after(6000, self.probe)
+            self.q.put("已启动游戏。冷启动可能要几十秒，助手会一直尝试连接…")
+            self.probe_loop(60)
         except Exception:
             log_error("start_game\n" + traceback.format_exc())
             messagebox.showerror("启动出错", f"详情已写入：\n{ERR_LOG}")
 
     def probe(self):
-        try:
-            self.engine.c = None
-            self.engine.connect()
-            info = self.engine.page_info or {}
-            n = info.get("slots", 0)
-            self.lbl.config(text=f"已连接（{n} 格）", foreground="#2f9e44")
-        except Exception as e:
-            self.lbl.config(text="未连上", foreground="#e03131")
-            self.q.put(f"连接失败：{e}")
+        """「连接」按钮：最多试 20 秒，失败就把诊断摊开。"""
+        self.probe_loop(20)
+
+    def probe_loop(self, seconds=60):
+        """在后台反复尝试连接，最长 seconds 秒。
+
+        不能只打一枪：低配机器（尤其 Win10 + 机械硬盘 + 杀软首次扫描 exe）
+        冷启动要十几秒到一分钟，端口在那之前根本没开。旧版固定等 6 秒只连
+        一次，没连上就永远红着「未连上」，看起来就像程序坏了。
+        """
+        if getattr(self, "_probing", False):
+            return
+        self._probing = True
+        self.q.put(("label", "正在连接…", "#f08c00"))
+        self.engine.dbg("开始连接，最长试 %d 秒" % seconds)
+
+        def work():
+            end = time.time() + seconds
+            n, last = 0, ""
+            try:
+                while time.time() < end:
+                    n += 1
+                    try:
+                        self.engine.c = None
+                        self.engine.connect()
+                        info = self.engine.page_info or {}
+                        self.q.put(("label", f"已连接（{info.get('slots', 0)} 格）", "#2f9e44"))
+                        return
+                    except Exception as e:
+                        last = str(e)
+                        if n == 1 or n % 4 == 0:
+                            self.engine.dbg("第 %d 次连接失败：%s" % (n, e))
+                    # 第 3 轮（约 4 秒后）看一眼游戏进程还在不在：
+                    # 进程都没了，再等下去也没意义，直接把原因说出来。
+                    if n == 3 and not cdp._proc_running("QuestAway.exe"):
+                        self.q.put("没检测到 QuestAway.exe —— 游戏没起来，或者启动后立刻退出了。\n"
+                                   "如果是刚点完启动就没了：多半是 WebView2 Runtime 缺失/损坏，"
+                                   "或者被杀毒软件拦了。")
+                    if n == 1 or n % 4 == 0:
+                        self.q.put(f"第 {n} 次连接没成功，2 秒后再试…")
+                    time.sleep(2)
+                self.q.put(("label", "未连上", "#e03131"))
+                self.q.put(f"连续 {n} 次都没连上。最后一次的原因：\n{last}")
+                try:
+                    self.q.put(cdp.diagnose(self.cfg.get("game_exe") or ""))
+                except Exception as e:
+                    self.q.put(f"诊断信息生成失败：{e}")
+            finally:
+                self._probing = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def dbg_put(self, msg):
+        """详细日志入口：任何线程都能调，只写队列、不碰控件。"""
+        line = "%s.%03d  %s" % (time.strftime("%H:%M:%S"),
+                                int(time.time() * 1000) % 1000, msg)
+        for _ in range(2):
+            try:
+                self.dq.put_nowait(line)
+                return
+            except queue.Full:
+                try:
+                    self.dq.get_nowait()   # 丢最老的，再塞一次
+                except queue.Empty:
+                    return
+
+    def open_debug(self):
+        if self.dbg_win:
+            try:
+                self.dbg_win.deiconify()
+                self.dbg_win.lift()
+                return
+            except Exception:
+                self.dbg_win = None
+        self.dbg_win = DebugWindow(self)
+        # 把打开之前攒下的记录也灌进去，太旧的没意义
+        hist = []
+        while True:
+            try:
+                hist.append(self.dq.get_nowait())
+            except queue.Empty:
+                break
+        if hist:
+            self.dbg_win.append("—— 下面是打开窗口前最近的 %d 条 ——" % min(len(hist), 300))
+            for h in hist[-300:]:
+                self.dbg_win.append(h)
 
     def drain(self):
+        # 详细日志只喂调试窗口；没开窗口就让它在队列里自己滚动（满了丢最老的）
+        if self.dbg_win:
+            try:
+                while True:
+                    self.dbg_win.append(self.dq.get_nowait())
+            except queue.Empty:
+                pass
+            except Exception:
+                self.dbg_win = None
         try:
             while True:
                 line = self.q.get_nowait()
+                # 后台线程不能直接碰 Tk 控件，状态栏也走队列
+                if isinstance(line, tuple):
+                    if line and line[0] == "label":
+                        self.lbl.config(text=line[1], foreground=line[2])
+                    continue
                 self.log_box.config(state="normal")
                 self.log_box.insert("end", f"{time.strftime('%H:%M:%S')}  {line}\n")
                 self.log_box.see("end")
@@ -1242,11 +1552,17 @@ class App(tk.Tk):
         threading.Thread(target=self._safe, args=(fn, *a), daemon=True).start()
 
     def _safe(self, fn, *a):
+        name = getattr(fn, "__name__", "任务")
+        self.engine.dbg(f"开始：{name}")
         try:
             fn(*a)
         except Exception as e:
             self.q.put(f"出错：{e}")
+            self.engine.dbg(f"{name} 出错：{e}\n{traceback.format_exc()}")
             self.engine.c = None
+        finally:
+            self.engine.action = "空闲"
+            self.engine.dbg(f"结束：{name}")
 
     def _rar_zh(self, key):
         return dict(RARITY).get(key, key)
