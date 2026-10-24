@@ -1481,6 +1481,14 @@ class App(tk.Tk):
         self.q.put(f"端口 {old} 连不上（{reason}），换 {new} 重启游戏再试…")
         self.engine.dbg("换端口：%d → %d（%s）" % (old, new, reason))
 
+        # 旧连接指向马上要被结束的进程，先关掉，别留悬空的 socket
+        try:
+            if self.engine.c:
+                self.engine.c.close()
+        except Exception:
+            pass
+        self.engine.c = None
+
         if not cdp.kill_game_pid(self._game_pid):
             self.engine.dbg("换端口：没能结束 pid=%s（可能已自行退出）" % self._game_pid)
         for _ in range(12):
