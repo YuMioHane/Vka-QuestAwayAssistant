@@ -45,22 +45,83 @@ def targets():
                        "游戏必须用助手里的「一键启动游戏」拉起，或用带调试端口的方式启动。")
 
 
-def pick():
-    """优先 tauri 主页面（url 以 / 结尾），其次 log.html，最后任意 page。"""
+def _rank(t):
+    u = t.get("url", "")
+    if "tauri.localhost" in u and u.rstrip("/").endswith("localhost"):
+        return 0
+    if "tauri.localhost" in u:
+        return 1
+    return 2
+
+
+# 判定「这个页面是不是游戏主界面」——只读 DOM，不点任何东西
+IS_GAME_JS = r"""
+(() => {
+  const q = s => document.querySelectorAll(s).length;
+  return {
+    winlayer: !!document.querySelector('#winlayer'),
+    dock: !!document.querySelector('#dock'),
+    actions: q('[data-action]'),
+    slots: q('.slot'),
+    href: location.href,
+    title: document.title || ''
+  };
+})()
+"""
+
+
+def is_game_page(info):
+    """游戏主界面有 #winlayer（窗口层）；log.html 只有 5 个零散按钮、0 个格子。"""
+    if not info:
+        return False
+    return bool(info.get("winlayer")) or (info.get("slots") or 0) >= 20
+
+
+def pick_game(max_try=8):
+    """挑「真正的游戏主界面」，返回 (CDP, info, target)。
+
+    9222 上一般有两个 page：主界面 `http://tauri.localhost/` 和
+    日志页 `http://tauri.localhost/log.html`。两个 WebSocket 都能连上，
+    但只有主界面有 #winlayer / .slot。以前只按 URL 排序就选第一个，
+    主界面还没加载完时会连到日志页 —— 表现正是「显示已连接，但所有
+    功能都没反应」（scan 全是空，而空结果不报错，于是一直错下去）。
+    """
     ts = [t for t in targets() if t.get("type") == "page"]
     if not ts:
         raise CdpError("没有找到游戏页面，游戏主窗口可能还没起来。")
+    ts.sort(key=_rank)
 
-    def rank(t):
-        u = t.get("url", "")
-        if "tauri.localhost" in u and u.rstrip("/").endswith("localhost"):
-            return 0
-        if "tauri.localhost" in u:
-            return 1
-        return 2
+    seen = []
+    for t in ts[:max_try]:
+        url = t.get("url", "?")
+        try:
+            c = CDP(t["webSocketDebuggerUrl"])
+        except Exception as e:
+            seen.append(f"{url}：连不上（{e}）")
+            continue
+        try:
+            info = c.eval(IS_GAME_JS) or {}
+        except Exception as e:
+            c.close()
+            seen.append(f"{url}：读不到页面（{e}）")
+            continue
+        if is_game_page(info):
+            return c, info, t
+        c.close()
+        seen.append(f'{url}：不是游戏界面（格子 {info.get("slots", 0)}、'
+                    f'动作 {info.get("actions", 0)}、窗口层 {info.get("winlayer")}）')
 
-    ts.sort(key=rank)
-    return ts[0]
+    raise CdpError(
+        "端口连上了，但没找到游戏主界面。\n"
+        + ("\n".join("· " + s for s in seen) if seen else "· 没有可用的页面")
+        + "\n\n游戏可能还在加载，或只连到了日志页。等游戏主界面出来后点「连接」再试。")
+
+
+def pick():
+    """返回游戏主页面的 target（内部会验证页面真的是游戏主界面）。"""
+    c, _info, t = pick_game()
+    c.close()
+    return t
 
 
 class CDP:
@@ -339,6 +400,9 @@ UI_SCAN_JS = r"""
   return {hasBag: !!bag, hasBench: !!bench, hasStash: !!stash,
           bagItems, stashItems, bagMats, stashMats, cube, out, free, freeBag,
           equipped, lockedCount,
+          // 页面身份：连错页（比如 log.html）时这两个都是 0/false，调用方据此重连
+          winlayer: !!document.querySelector('#winlayer'),
+          slots: document.querySelectorAll('.slot').length,
           cubeFilled: cube.filter(c => c.filled).length,
           outFilled: out.filter(c => c.filled).length};
 })()

@@ -91,13 +91,18 @@ RARITY = [("common", "普通"), ("uncommon", "精良"), ("rare", "稀有"),
 CUBE_NEED = 8
 
 AUTHOR_URL = "https://space.bilibili.com/8044987"
+REPO_URL = "https://github.com/YuMioHane/Vka-QuestAwayAssistant"
+# 公告内容变了就 +1：老用户即使勾过「以后不再显示」也会再看一次
+NOTICE_VER = 2
 
 DEFAULT_CFG = {
     "game_exe": "",
     "map_a": "6:5", "map_b": "6:6", "map_stay": 60,
     "chest": 6, "craft": 120, "store": 60,
     "craft_rar": ["common"], "store_rar": ["common", "uncommon"],
-    "notice_skip": False,
+    # 转化材料筛选：空 = 自动挑数量最多的一种；否则只合成这些 stack
+    "craft_mats": [], "craft_mat_names": {},
+    "notice_skip": False, "notice_ver": 0,
 }
 
 GUESS = [
@@ -223,6 +228,7 @@ class Engine:
         self.log = log
         self.stop = threading.Event()
         self.c = None
+        self.page_info = {}
         self.stat = {"switches": 0, "chests": 0, "crafts": 0, "stored": 0}
 
     def ui_flags(self):
@@ -254,9 +260,11 @@ class Engine:
     def connect(self):
         if self.c:
             return self.c
-        t = cdp.pick()
-        self.c = cdp.CDP(t["webSocketDebuggerUrl"])
-        self.log(f"已连接：{t.get('title')}")
+        c, info, t = cdp.pick_game()
+        self.c = c
+        self.page_info = info
+        self.log(f"已连接游戏主界面：{info.get('href') or t.get('url')}"
+                 f"（页面格子 {info.get('slots', 0)} 个）")
         return self.c
 
     def alive(self):
@@ -268,7 +276,17 @@ class Engine:
             return False
 
     def scan(self):
-        return self.connect().eval(cdp.UI_SCAN_JS)
+        s = self.connect().eval(cdp.UI_SCAN_JS)
+        # 页面不对（连到了日志页等）时 scan 会全空且不报错，功能看着「没反应」。
+        # 这里硬判一次页面身份，不对就断开，让下次 connect 重新挑主界面。
+        if not s or not (s.get("winlayer") or (s.get("slots") or 0) >= 20):
+            try:
+                self.c.close()
+            except Exception:
+                pass
+            self.c = None
+            raise cdp.CdpError("当前连接的不是游戏主界面，已断开，稍后自动重连")
+        return s
 
     def ensure_ui(self, bag=True, bench=False, stash=False):
         c = self.connect()
@@ -392,6 +410,9 @@ class Engine:
 
     def craft_equipment(self, rarities=None, need=CUBE_NEED):
         """装备 8 合 1：右键逐个放入同稀有度的装备。"""
+        if rarities is not None and not rarities:
+            self.log("装备转化跳过：没勾稀有度（不知道要合哪种）")
+            return False
         c = self.connect()
         before_ui = self.ui_flags()
         rarities = rarities or ["common", "uncommon", "rare", "heroic", "mythic"]
@@ -567,12 +588,45 @@ class Engine:
         self.restore_ui(before_ui)
         return False
 
-    def craft(self, mode="equipment"):
-        if mode == "material":
+    def craft_materials(self, stacks=None):
+        """按材料筛选逐个合成：勾中哪种，就单独把哪种搬进背包再 8 合 1。
+
+        stacks 为空 = 不筛选，沿用「自动挑数量最多的一种」。
+        先估一遍每种材料的总格数，凑不满 8 格的直接跳过，免得反复开关窗口。
+        """
+        if not stacks:
             return self.craft_material()
+        s = self.scan()
+        total, names = {}, {}
+        for m in s["stashMats"] + s["bagMats"]:
+            total[m["stack"]] = total.get(m["stack"], 0) + 1
+            if m["title"]:
+                names[m["stack"]] = m["title"]
+        done, skipped = 0, []
+        for st in stacks:
+            if self.stop.is_set():
+                break
+            # total 为空（扫描失败）时不做预判，交给 craft_material 自己判断
+            if total and total.get(st, 0) < CUBE_NEED:
+                skipped.append(st)
+                continue
+            if self.craft_material(st):
+                done += 1
+                if self.stop.wait(1.0):
+                    break
+        if skipped:
+            self.log("材料转化跳过（凑不满 %d 格）：%s" % (
+                CUBE_NEED, "、".join(names.get(k, k) for k in skipped)))
+        if not done and not skipped:
+            self.log("材料转化：勾选的材料已经没得合了")
+        return done > 0
+
+    def craft(self, mode="equipment", rarities=None, mats=None):
+        if mode == "material":
+            return self.craft_materials(mats)
         if mode == "both":
-            return self.craft_equipment() or self.craft_material()
-        return self.craft_equipment()
+            return self.craft_equipment(rarities) or self.craft_materials(mats)
+        return self.craft_equipment(rarities)
 
     # ---------- 4b 取回（仓库 → 背包，右键） ----------
     def take(self, rarities=None, limit=60):
@@ -707,7 +761,7 @@ class App(tk.Tk):
             pass
 
     def show_notice(self):
-        if self.cfg.get("notice_skip"):
+        if self.cfg.get("notice_skip") and int(self.cfg.get("notice_ver") or 0) >= NOTICE_VER:
             return
         win = tk.Toplevel(self)
         win.title("关于本软件")
@@ -719,36 +773,47 @@ class App(tk.Tk):
         body.pack(fill="both", expand=True)
 
         ttk.Label(body, text="QuestAway 助手", font=("Microsoft YaHei UI", 15, "bold")).pack(anchor="w")
-        ttk.Label(body, text="完全免费 · 开源（代码待上传 GitHub）",
+        ttk.Label(body, text="完全免费 · 已开源（GitHub 公开仓库）",
                   font=("Microsoft YaHei UI", 11, "bold"), foreground="#2f9e44").pack(anchor="w", pady=(6, 10))
         ttk.Label(body, justify="left", wraplength=400,
                   text="如果有人向你收费（激活码、会员、代挂、付费下载等），\n"
                        "请立刻申请退款，并向平台举报。作者从未、也不会收任何费用。"
                   ).pack(anchor="w")
+
+        ttk.Label(body, justify="left", wraplength=400, foreground="#495057",
+                  text="源码、最新版本、更新日志、问题反馈都在这个仓库里："
+                  ).pack(anchor="w", pady=(12, 2))
+        rlink = ttk.Label(body, text="Vka-QuestAwayAssistant ↗", foreground="#1c7ed6", cursor="hand2")
+        rlink.pack(anchor="w")
+        rlink.bind("<Button-1>", lambda e: open_url(REPO_URL))
+        ttk.Label(body, text=REPO_URL, foreground="#8b93a1", wraplength=400,
+                  justify="left").pack(anchor="w")
+
         ttk.Label(body, justify="left", wraplength=400, foreground="#8b93a1",
                   text="软件只操作游戏里本来就有的按钮与格子，不改存档、不改协议。\n"
                        "「自动转化」「自动存仓」为试验功能，会真实处理物品，后果自负；\n"
                        "身上装备与上锁物品程序硬拦，永不触碰。"
                   ).pack(anchor="w", pady=(10, 0))
 
-        link = ttk.Label(body, text="作者 B 站主页 ↗", foreground="#1c7ed6", cursor="hand2")
-        link.pack(anchor="w", pady=(10, 0))
-        link.bind("<Button-1>", lambda e: open_url(AUTHOR_URL))
+        alink = ttk.Label(body, text="作者 B 站主页 ↗", foreground="#1c7ed6", cursor="hand2")
+        alink.pack(anchor="w", pady=(10, 0))
+        alink.bind("<Button-1>", lambda e: open_url(AUTHOR_URL))
         ttk.Label(body, text=AUTHOR_URL, foreground="#8b93a1").pack(anchor="w")
 
         skip = tk.BooleanVar(value=False)
         ttk.Checkbutton(body, text="以后不再显示", variable=skip).pack(anchor="w", pady=(12, 8))
 
         def close():
+            self.cfg["notice_ver"] = NOTICE_VER
             if skip.get():
                 self.cfg["notice_skip"] = True
-                save_cfg(self.cfg)
+            save_cfg(self.cfg)
             win.destroy()
 
         row = ttk.Frame(body)
         row.pack(fill="x")
-        ttk.Button(row, text="打开作者主页",
-                   command=lambda: open_url(AUTHOR_URL)).pack(side="left")
+        ttk.Button(row, text="打开发布页",
+                   command=lambda: open_url(REPO_URL)).pack(side="left")
         ttk.Button(row, text="我知道了", command=close).pack(side="right")
 
         win.protocol("WM_DELETE_WINDOW", close)
@@ -801,24 +866,41 @@ class App(tk.Tk):
         self.chest_sec = tk.StringVar()
         ttk.Spinbox(g2, from_=2, to=600, width=5, textvariable=self.chest_sec).grid(row=0, column=2)
 
-        g3 = ttk.LabelFrame(self, text=" 3 · 自动转化（工作台自动填入 → 转化） ", padding=8)
+        g3 = ttk.LabelFrame(self, text=" 3 · 自动转化（右键逐个放入 → 点转化） ", padding=8)
         g3.pack(fill="x", **pad)
         self.craft_on = tk.BooleanVar()
         ttk.Checkbutton(g3, text="启用", variable=self.craft_on).grid(row=0, column=0, sticky="w")
         ttk.Label(g3, text="间隔(秒)").grid(row=0, column=1, padx=(10, 2))
         self.craft_sec = tk.StringVar()
         ttk.Spinbox(g3, from_=20, to=7200, width=5, textvariable=self.craft_sec).grid(row=0, column=2)
-        self.craft_vars = {}
-        ttk.Label(g3, text="转化对象").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(g3, text="对象").grid(row=0, column=3, padx=(10, 2))
         self.craft_mode = tk.StringVar(value="材料")
-        ttk.Combobox(g3, values=["材料", "装备", "材料+装备"], width=10, state="readonly",
-                     textvariable=self.craft_mode).grid(row=1, column=1, sticky="w", pady=(6, 0))
-        ttk.Label(g3, text="右键逐个放入 8 格 → 点转化（不用自动填入、不拖拽）",
-                  foreground="#495057").grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 0))
-        ttk.Label(g3, text="⚠ 试验功能：转化会消耗物品、结果不可逆，出问题后果自负",
-                  foreground="#c92a2a").grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
-        ttk.Label(g3, text="装备中 / 上锁的物品永不触碰（程序硬拦）",
-                  foreground="#8b93a1").grid(row=4, column=0, columnspan=4, sticky="w")
+        ttk.Combobox(g3, values=["材料", "装备", "材料+装备"], width=9, state="readonly",
+                     textvariable=self.craft_mode).grid(row=0, column=4, columnspan=2, sticky="w")
+
+        # 筛选①：装备稀有度 —— 勾哪种就只把哪种搬进背包再合
+        ttk.Label(g3, text="装备稀有度").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        pick_c = ttk.Frame(g3)
+        pick_c.grid(row=1, column=1, columnspan=5, sticky="w", pady=(8, 0))
+        self.craft_vars = {}
+        for i, (k, z) in enumerate(RARITY[:6]):
+            v = tk.BooleanVar()
+            self.craft_vars[k] = v
+            ttk.Checkbutton(pick_c, text=z, variable=v).grid(row=0, column=i, padx=(0, 2))
+
+        # 筛选②：材料种类 —— 勾哪种就只把哪种搬进背包再合
+        ttk.Label(g3, text="材料种类").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(g3, text="选择材料…", command=self.pick_materials).grid(
+            row=2, column=1, sticky="w", pady=(4, 0))
+        self.lbl_mats = ttk.Label(g3, text="", foreground="#8b93a1")
+        self.lbl_mats.grid(row=2, column=2, columnspan=4, sticky="w", pady=(4, 0))
+
+        ttk.Label(g3, text="勾什么就只把什么单独搬进背包再合成；材料不选 = 自动挑数量最多的一种",
+                  foreground="#8b93a1", wraplength=430, justify="left").grid(
+            row=3, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        ttk.Label(g3, text="⚠ 试验功能：转化会消耗物品、结果不可逆；装备中/上锁永不触碰",
+                  foreground="#c92a2a", wraplength=430, justify="left").grid(
+            row=4, column=0, columnspan=6, sticky="w")
 
         g4 = ttk.LabelFrame(self, text=" 4 · 自动存仓（背包 → 仓库） ", padding=8)
         g4.pack(fill="x", **pad)
@@ -876,8 +958,7 @@ class App(tk.Tk):
         ttk.Button(bar, text="收箱一次",
                    command=lambda: self.run_async(self.engine.open_chests)).pack(side="left", padx=6)
         ttk.Button(bar, text="转化一次",
-                   command=lambda: self.run_async(self.engine.craft,
-                                                  self.cfg.get("craft_mode", "material"))).pack(side="left")
+                   command=lambda: self.run_async(self.craft_once)).pack(side="left")
         ttk.Button(bar, text="存仓一次", command=lambda: self.run_async(
             self.engine.store, self.picked_cfg("store_rar"))).pack(side="left", padx=6)
         ttk.Button(bar, text="取回一次",
@@ -887,17 +968,23 @@ class App(tk.Tk):
             "mat" if self.cfg.get("dis_kind") == "材料" else "item",
             8, self.dis_bagonly.get())).pack(side="left", padx=6)
 
-        # 底部：免费开源声明 + 作者主页（必须先于可扩展的日志框打包，否则会被挤没）
+        # 底部：免费开源声明 + 仓库/作者链接（必须先于可扩展的日志框打包，否则会被挤没）
         bottom = ttk.Frame(self)
         bottom.pack(side="bottom", fill="x", padx=10, pady=(0, 8))
-        ttk.Label(bottom, text="本软件完全免费、开源（代码待上传 GitHub）。若遇到收费，请立刻申请退款。",
+        ttk.Label(bottom, text="本软件完全免费、已开源。若遇到收费，请立刻申请退款并举报。",
                   foreground="#c92a2a", wraplength=450, justify="left").pack(side="top", anchor="w")
-        linkrow = ttk.Frame(bottom)
-        linkrow.pack(side="top", fill="x", pady=(4, 0))
-        link = ttk.Label(linkrow, text="作者 B 站主页 ↗", foreground="#1c7ed6", cursor="hand2")
-        link.pack(side="left")
-        link.bind("<Button-1>", lambda e: open_url(AUTHOR_URL))
-        ttk.Label(linkrow, text=f"   {AUTHOR_URL}", foreground="#8b93a1").pack(side="left")
+        row1 = ttk.Frame(bottom)
+        row1.pack(side="top", fill="x", pady=(4, 0))
+        lk = ttk.Label(row1, text="GitHub 仓库 · YuMioHane/Vka-QuestAwayAssistant ↗",
+                       foreground="#1c7ed6", cursor="hand2")
+        lk.pack(side="left")
+        lk.bind("<Button-1>", lambda e: open_url(REPO_URL))
+        row2 = ttk.Frame(bottom)
+        row2.pack(side="top", fill="x")
+        lk2 = ttk.Label(row2, text="作者 B 站主页 ↗", foreground="#1c7ed6", cursor="hand2")
+        lk2.pack(side="left")
+        lk2.bind("<Button-1>", lambda e: open_url(AUTHOR_URL))
+        ttk.Label(row2, text=f"   {AUTHOR_URL}", foreground="#8b93a1").pack(side="left")
 
         self.log_box = tk.Text(self, height=10, wrap="none", font=("Consolas", 9),
                                background="#fbfcfe", borderwidth=0)
@@ -907,6 +994,120 @@ class App(tk.Tk):
         self.log_box.pack(fill="both", expand=True, padx=(10, 0), pady=(8, 4))
 
     # ---------- 配置 ----------
+    def _update_mat_label(self):
+        sel = list(self.cfg.get("craft_mats") or [])
+        names = self.cfg.get("craft_mat_names") or {}
+        if not sel:
+            self.lbl_mats.config(text="自动（挑数量最多的一种）", foreground="#8b93a1")
+            return
+        shown = "、".join(names.get(k, k) for k in sel[:3])
+        tail = f" 等 {len(sel)} 种" if len(sel) > 3 else f"（{len(sel)} 种）"
+        self.lbl_mats.config(text=shown + tail, foreground="#2f9e44")
+
+    def pick_materials(self):
+        """选要合成的材料种类：勾中的才会单独搬进背包，凑满 8 格再合。"""
+        groups = {}
+        if self.engine.c:
+            try:
+                s = self.engine.scan()
+                for m in s["bagMats"]:
+                    g = groups.setdefault(m["stack"], {"title": m["title"] or m["stack"],
+                                                       "bag": 0, "stash": 0})
+                    g["bag"] += 1
+                for m in s["stashMats"]:
+                    g = groups.setdefault(m["stack"], {"title": m["title"] or m["stack"],
+                                                       "bag": 0, "stash": 0})
+                    g["stash"] += 1
+            except Exception as e:
+                self.q.put(f"读材料列表失败：{e}")
+        # 游戏没连上时，用上次记下的名字兜底，至少能取消掉旧筛选
+        for k, t in (self.cfg.get("craft_mat_names") or {}).items():
+            groups.setdefault(k, {"title": t, "bag": 0, "stash": 0})
+        if not groups:
+            messagebox.showinfo("没有材料",
+                                "先点「连接」把游戏连上，并打开背包或仓库，再回来选材料。")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("选择要合成的材料")
+        win.transient(self)
+        win.attributes("-topmost", True)
+        win.configure(bg="#ffffff")
+        win.resizable(False, False)
+        outer = ttk.Frame(win, padding=14)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="选择要合成的材料",
+                  font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(outer, text="勾中的材料才会被单独搬进背包，凑满 8 格才合成。\n"
+                              "一个都不勾 = 自动挑数量最多的一种。",
+                  foreground="#8b93a1", justify="left").pack(anchor="w", pady=(4, 8))
+
+        wrap = ttk.Frame(outer)
+        wrap.pack(fill="both", expand=True)
+        canvas = tk.Canvas(wrap, width=410, height=300, borderwidth=0, highlightthickness=0)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        sel = set(self.cfg.get("craft_mats") or [])
+        vars_ = {}
+        order = sorted(groups.items(), key=lambda kv: (-(kv[1]["bag"] + kv[1]["stash"]),
+                                                      kv[1]["title"]))
+        for i, (stack, g) in enumerate(order):
+            v = tk.BooleanVar(value=stack in sel)
+            vars_[stack] = v
+            ttk.Checkbutton(inner, text=g["title"], variable=v).grid(
+                row=i, column=0, sticky="w", pady=1)
+            tot = g["bag"] + g["stash"]
+            if tot:
+                info = f"共 {tot} 格（背包 {g['bag']}）"
+            else:
+                info = "当前不在背包/仓库"
+            ttk.Label(inner, text=info,
+                      foreground=("#8b93a1" if tot else "#c9ced6")).grid(
+                row=i, column=1, sticky="w", padx=(10, 0))
+
+        row = ttk.Frame(outer)
+        row.pack(fill="x", pady=(10, 0))
+
+        def pick_big():
+            for stack, g in order:
+                vars_[stack].set(g["bag"] + g["stash"] >= CUBE_NEED)
+
+        def clear():
+            for v in vars_.values():
+                v.set(False)
+
+        def ok():
+            chosen = [s for s, v in vars_.items() if v.get()]
+            nm = dict(self.cfg.get("craft_mat_names") or {})
+            for s in chosen:
+                nm[s] = groups[s]["title"]
+            self.cfg["craft_mats"] = chosen
+            self.cfg["craft_mat_names"] = nm
+            save_cfg(self.cfg)
+            self._update_mat_label()
+            if chosen:
+                self.q.put("转化材料筛选：" + "、".join(nm.get(s, s) for s in chosen))
+            else:
+                self.q.put("转化材料筛选：不筛选（自动挑数量最多的一种）")
+            win.destroy()
+
+        ttk.Button(row, text="都不选", command=clear).pack(side="left")
+        ttk.Button(row, text="选 ≥8 格的", command=pick_big).pack(side="left", padx=6)
+        ttk.Button(row, text="确定", command=ok).pack(side="right")
+        ttk.Button(row, text="取消", command=win.destroy).pack(side="right", padx=6)
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+        y = self.winfo_rooty() + 100
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        win.grab_set()
+
     def _refresh_cfg(self):
         c = self.cfg
         self.map_a.set(c["map_a"])
@@ -919,6 +1120,9 @@ class App(tk.Tk):
             v.set(k in c["store_rar"])
         rev = {"material": "材料", "equipment": "装备", "both": "材料+装备"}
         self.craft_mode.set(rev.get(c.get("craft_mode", "material"), "材料"))
+        for k, v in self.craft_vars.items():
+            v.set(k in list(c.get("craft_rar") or []))
+        self._update_mat_label()
         self.store_mats.set(c.get("store_mats", True))
         self.dis_sec.set(str(c.get("dis_sec", 180)))
         self.dis_kind.set(c.get("dis_kind", "装备"))
@@ -950,6 +1154,7 @@ class App(tk.Tk):
             "map_stay": self.map_sec.get(), "chest": self.chest_sec.get(),
             "craft": self.craft_sec.get(), "store": self.store_sec.get(),
             "store_rar": [k for k, v in self.store_vars.items() if v.get()],
+            "craft_rar": [k for k, v in self.craft_vars.items() if v.get()],
             "craft_mode": {"材料": "material", "装备": "equipment",
                            "材料+装备": "both"}.get(self.craft_mode.get(), "material"),
             "store_mats": self.store_mats.get(),
@@ -1006,7 +1211,9 @@ class App(tk.Tk):
         try:
             self.engine.c = None
             self.engine.connect()
-            self.lbl.config(text="已连接", foreground="#2f9e44")
+            info = self.engine.page_info or {}
+            n = info.get("slots", 0)
+            self.lbl.config(text=f"已连接（{n} 格）", foreground="#2f9e44")
         except Exception as e:
             self.lbl.config(text="未连上", foreground="#e03131")
             self.q.put(f"连接失败：{e}")
@@ -1022,6 +1229,13 @@ class App(tk.Tk):
         except queue.Empty:
             pass
         self.after(250, self.drain)
+
+    def craft_once(self):
+        """「转化一次」按钮：带上界面上勾好的筛选。"""
+        return self.engine.craft(
+            self.cfg.get("craft_mode", "material"),
+            list(self.cfg.get("craft_rar") or []),
+            list(self.cfg.get("craft_mats") or []))
 
     def run_async(self, fn, *a):
         self._collect()
@@ -1205,7 +1419,9 @@ class App(tk.Tk):
                     e.open_chests()
                     next_chest = time.time() + chest_every
                 if s.get("craft_on") and now >= next_craft:
-                    e.craft(s.get("craft_mode") or "material")
+                    e.craft(s.get("craft_mode") or "material",
+                            rarities=list(s.get("craft_rar") or []),
+                            mats=list(s.get("craft_mats") or []))
                     next_craft = time.time() + craft_every
                 if s.get("store_on") and now >= next_store:
                     e.store(list(s.get("store_rar") or []), include_mats=s.get("store_mats", True))
