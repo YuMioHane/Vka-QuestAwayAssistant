@@ -1,0 +1,17 @@
+# 构建产物
+build/
+release/
+release*/
+dist/
+*.spec
+
+# 运行产物
+helper_config.json
+helper_error.log
+helper_error.prev.log
+__pycache__/
+*.pyc
+
+# 编辑器
+.vscode/
+.idea/
