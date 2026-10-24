@@ -37,7 +37,8 @@ QuestAway 的外部挂机助手。**完全免费、开源**，不修改游戏文
 
 游戏是 Tauri + WebView2，通过自己的调试端口连接页面：
 
-- 用 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222` 启动游戏；
+- 用 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<空端口>` 启动游戏
+  （端口不固定：从 9222 起挑第一个没被占用的，避免撞上别的调试工具）；
 - CDP 连上页面后，**只做两件事**：派发游戏自己的 `data-action` 点击、对物品元素派发右键事件；
 - 不注入游戏逻辑、不调用内部函数、不伪造结算数据。
 
@@ -83,7 +84,7 @@ QuestAway 的外部挂机助手。**完全免费、开源**，不修改游戏文
 
 **点「连接」显示已连接，但换关/收箱/转化全都没反应？**
 
-9222 端口上除了游戏主界面，还有一个 `log.html` 日志页，两个 target 的 WebSocket 都能连上。
+调试端口上除了游戏主界面，还有一个 `log.html` 日志页，两个 target 的 WebSocket 都能连上。
 旧版只按 URL 排序挑第一个，主界面还没加载完时会连到日志页——DOM 扫描全是空，但空结果不报错，
 于是一直错下去，表现就是「显示已连接，功能全废」。
 

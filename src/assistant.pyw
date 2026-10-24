@@ -83,7 +83,8 @@ if sys.stderr is None:
 
 DATA_DIR = os.path.dirname(_FALLBACK_LOG)   # 配置仍放可写目录
 CFG_PATH = os.path.join(DATA_DIR, "helper_config.json")
-PORT = "9222"
+# 调试端口是动态的，见 cdp.pick_port / launch_game；这里只做起点
+PORT = cdp.DEFAULT_PORT
 
 RARITY = [("common", "普通"), ("uncommon", "精良"), ("rare", "稀有"),
           ("heroic", "英雄"), ("epic", "史诗"), ("mythic", "神话"),
@@ -172,29 +173,45 @@ def game_running():
         return False
 
 
-def launch_game(exe):
-    """启动游戏；把 Windows 常见错误翻译成人话，绝不裸抛。"""
+def _debug_browser_args(port):
+    """拼 WebView2 的启动参数：保留用户原有的，只换掉端口那一项。
+
+    调试端口不是固定值 —— 就是这一行决定的。想开哪个口就开哪个口，
+    所以 9222 被占时可以换成 9223、9224…… 而不必去关掉占用它的软件。
+    """
+    old = os.environ.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "")
+    parts = [x for x in old.split() if not x.startswith("--remote-debugging-port")]
+    parts.append("--remote-debugging-port=%d" % int(port))
+    return " ".join(parts)
+
+
+def launch_game(exe, port=None):
+    """启动游戏；把 Windows 常见错误翻译成人话，绝不裸抛。
+
+    返回 (错误文案, 进程号)。进程号用于之后换端口时只杀自己启动的那一个。
+    """
+    port = int(port or cdp.get_port())
     env = dict(os.environ)
-    env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = f"--remote-debugging-port={PORT}"
+    env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = _debug_browser_args(port)
     try:
-        subprocess.Popen([exe], cwd=os.path.dirname(exe), env=env,
-                         creationflags=0x00000008)  # DETACHED_PROCESS
-        return None
+        p = subprocess.Popen([exe], cwd=os.path.dirname(exe), env=env,
+                             creationflags=0x00000008)  # DETACHED_PROCESS
+        return None, p.pid
     except FileNotFoundError:
-        return "找不到游戏文件，路径可能选错了，重新选一次 QuestAway.exe。"
+        return "找不到游戏文件，路径可能选错了，重新选一次 QuestAway.exe。", 0
     except PermissionError:
         return ("系统拒绝了启动（错误 5）。通常是杀毒软件拦截，"
-                "把这个程序加入白名单后再试。")
+                "把这个程序加入白名单后再试。"), 0
     except OSError as e:
         code = getattr(e, "winerror", None)
         if code == 740:
             return ("游戏要求管理员权限（错误 740）。\n"
-                    "请关掉助手，右键「以管理员身份运行」后再点一键启动。")
+                    "请关掉助手，右键「以管理员身份运行」后再点一键启动。"), 0
         if code == 193:
-            return "选到的不是有效的 Windows 程序，路径选错了。"
-        return f"启动失败：{e}"
+            return "选到的不是有效的 Windows 程序，路径选错了。", 0
+        return f"启动失败：{e}", 0
     except Exception as e:
-        return f"启动失败：{e}"
+        return f"启动失败：{e}", 0
 
 
 def close_windows(c, limit=5):
@@ -946,7 +963,7 @@ class App(tk.Tk):
         super().__init__()
         # 任何界面回调里的异常都记日志 + 弹窗，绝不让它把进程带走
         self.report_callback_exception = self._on_error
-        self.title("QuestAway 助手")
+        self.title("QuestAway 助手 · 调试版")
         self.geometry("490x820+820+10")
         self.attributes("-topmost", True)
         self.cfg = load_cfg()
@@ -959,6 +976,8 @@ class App(tk.Tk):
         self._warned = False
         self._syncing = False
         self._probing = False
+        self._game_pid = 0        # 只有这个游戏是助手启动的，才允许换端口重启它
+        self._relaunches = 0      # 已经换过几次端口
         self._build()
         self._refresh_cfg()
         for k in self.store_vars:
@@ -1415,12 +1434,22 @@ class App(tk.Tk):
                                     "检测到 QuestAway 正在运行。\n"
                                     "请先完全退出游戏，再用这里启动，否则没有调试端口。")
                 return
-            err = launch_game(exe)
+            # 先挑一个空端口：9222 被别的软件占着时，WebView2 开不出调试端口，
+            # 游戏照样能玩但助手永远连不上。顺延一个口就能避开这类机器。
+            port = cdp.pick_port(PORT)
+            cdp.set_port(port)
+            err, pid = launch_game(exe, port)
             if err:
                 log_error("launch_game: " + err)
                 messagebox.showerror("启动失败", err)
                 return
-            self.q.put("已启动游戏。冷启动可能要几十秒，助手会一直尝试连接…")
+            self._game_pid = pid
+            self._relaunches = 0
+            if port == PORT:
+                self.q.put(f"已启动游戏（调试端口 {port}）。冷启动可能要几十秒，助手会一直尝试连接…")
+            else:
+                self.q.put(f"端口 {PORT} 被别的软件占着，改用 {port} 启动游戏。")
+            self.engine.dbg("启动游戏：pid=%s，调试端口=%d" % (pid, port))
             self.probe_loop(60)
         except Exception:
             log_error("start_game\n" + traceback.format_exc())
@@ -1430,22 +1459,67 @@ class App(tk.Tk):
         """「连接」按钮：最多试 20 秒，失败就把诊断摊开。"""
         self.probe_loop(20)
 
+    def _switch_port(self, reason):
+        """换一个空端口重启游戏，返回新端口号；不能重启时返回 0。
+
+        两个前提，缺一不可：
+        1. 这个游戏是助手启动的（记着 pid）——用户自己从 Steam 开的游戏，
+           助手绝不能去杀，那等于把人家正在玩的进程砍了；
+        2. 已经换过的次数没超上限，避免死循环重启。
+        """
+        if self._relaunches >= 3:
+            self.q.put("已经换了 3 个端口，游戏的调试端口还是没开 —— 先停在这里，"
+                       "把下面这段诊断发给作者。")
+            return 0
+        if not self._game_pid:
+            self.q.put("这个游戏不是助手启动的，助手不去动它。\n"
+                       "请完全退出游戏，再用「一键启动游戏」重来一次。")
+            return 0
+
+        old = cdp.get_port()
+        new = cdp.pick_port(old + 1)
+        self.q.put(f"端口 {old} 连不上（{reason}），换 {new} 重启游戏再试…")
+        self.engine.dbg("换端口：%d → %d（%s）" % (old, new, reason))
+
+        if not cdp.kill_game_pid(self._game_pid):
+            self.engine.dbg("换端口：没能结束 pid=%s（可能已自行退出）" % self._game_pid)
+        for _ in range(12):
+            if not game_running():
+                break
+            time.sleep(0.5)
+
+        exe = self.cfg.get("game_exe") or guess_game_exe()
+        err, pid = launch_game(exe, new)
+        if err:
+            self.q.put("换端口后启动失败：" + err)
+            self._game_pid = 0
+            return 0
+        cdp.set_port(new)
+        self._game_pid = pid
+        self._relaunches += 1
+        self.q.put(("label", f"正在连接（端口 {new}）…", "#f08c00"))
+        self.engine.dbg("换端口重启完成：pid=%s，端口=%d" % (pid, new))
+        return new
+
     def probe_loop(self, seconds=60):
         """在后台反复尝试连接，最长 seconds 秒。
 
         不能只打一枪：低配机器（尤其 Win10 + 机械硬盘 + 杀软首次扫描 exe）
         冷启动要十几秒到一分钟，端口在那之前根本没开。旧版固定等 6 秒只连
         一次，没连上就永远红着「未连上」，看起来就像程序坏了。
+
+        端口是动态的：等 20 秒还没开出来，就换个空端口重启游戏再来一轮。
         """
         if getattr(self, "_probing", False):
             return
         self._probing = True
-        self.q.put(("label", "正在连接…", "#f08c00"))
-        self.engine.dbg("开始连接，最长试 %d 秒" % seconds)
+        self.q.put(("label", f"正在连接（端口 {cdp.get_port()}）…", "#f08c00"))
+        self.engine.dbg("开始连接，端口 %d，最长试 %d 秒" % (cdp.get_port(), seconds))
 
         def work():
             end = time.time() + seconds
             n, last = 0, ""
+            no_switch = False
             try:
                 while time.time() < end:
                     n += 1
@@ -1454,11 +1528,33 @@ class App(tk.Tk):
                         self.engine.connect()
                         info = self.engine.page_info or {}
                         self.q.put(("label", f"已连接（{info.get('slots', 0)} 格）", "#2f9e44"))
+                        self.engine.dbg("连接成功，端口 %d" % cdp.get_port())
                         return
                     except Exception as e:
                         last = str(e)
                         if n == 1 or n % 4 == 0:
-                            self.engine.dbg("第 %d 次连接失败：%s" % (n, e))
+                            self.engine.dbg("第 %d 次连接失败（端口 %d）：%s"
+                                            % (n, cdp.get_port(), e))
+
+                    # 换端口的两个触发条件
+                    switch = ""
+                    if cdp._port_listening():
+                        who = cdp.port_owner_name()
+                        if who and "questaway" not in who and "webview" not in who:
+                            # 端口被别的软件占着，而且不是游戏 —— 等下去也不会变
+                            switch = "端口被 %s 占着" % who
+                    elif n >= 10:
+                        # 等了约 20 秒端口还是没开：这次启动没把调试端口带出来
+                        switch = "端口一直没开"
+                    if switch and not no_switch:
+                        new = self._switch_port(switch)
+                        if new:
+                            n, last = 0, ""
+                            end = max(end, time.time() + 45)   # 重启给了新一轮时间
+                            continue
+                        # 换不了（不是助手启动的 / 已换到上限）就别反复刷同样的提示
+                        no_switch = True
+
                     # 第 3 轮（约 4 秒后）看一眼游戏进程还在不在：
                     # 进程都没了，再等下去也没意义，直接把原因说出来。
                     if n == 3 and not cdp._proc_running("QuestAway.exe"):

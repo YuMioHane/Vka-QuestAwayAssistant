@@ -24,7 +24,11 @@ try:
 except ImportError:
     raise ImportError("缺依赖 websocket-client，请 pip install websocket-client")
 
+# 调试端口不是固定的：它是我们启动游戏时用 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
+# 传给 WebView2 的参数，想让游戏开哪个端口就开哪个。
+# 9222 只是「从这儿开始挑」的默认起点 —— 被别的软件占了就顺延到下一个空口。
 PORT = int(os.environ.get("CDP_PORT", "9222"))
+DEFAULT_PORT = 9222
 BASE = os.path.dirname(os.path.abspath(__file__))
 
 # 本机开了系统代理（clash 之类）时 urllib 会把 127.0.0.1 也塞给代理，返回 502。全部绕开。
@@ -56,6 +60,87 @@ def _port_listening(port=None):
             s.close()
         except Exception:
             pass
+
+
+def get_port():
+    return PORT
+
+
+def set_port(port):
+    """切成别的调试端口，返回旧端口。"""
+    global PORT
+    old = PORT
+    try:
+        PORT = int(port)
+    except Exception:
+        pass
+    return old
+
+
+def port_free(port):
+    """bind 得动 = 这个端口空着，我们可以让 WebView2 用它。
+
+    故意不加 SO_REUSEADDR：Windows 上它会把「已被监听」也算成可绑，
+    那样就查不出占用了。
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.3)
+    try:
+        s.bind(("127.0.0.1", int(port)))
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def pick_port(start=None, span=40):
+    """从起点往上找第一个空端口；实在找不到就退回起点。
+
+    为什么启动前要先挑：WebView2 的调试端口被别的软件占着时，游戏照样能开，
+    但 --remote-debugging-port 会开不出来，表现就是「永远连不上 9222」。
+    先挑个空口，这类机器一次就能连上。
+    """
+    start = int(start or PORT)
+    for p in range(start, min(start + span, 65536)):
+        if port_free(p):
+            return p
+    return start
+
+
+def port_owner_name(port=None):
+    """监听者的进程名（小写）。查不到具体名字时返回空串 ——
+    空串表示「说不好是谁」，调用方不能据此认为端口被别人占了。"""
+    who = port_owner(port)
+    if not who or "(PID" not in who:
+        return ""
+    name = who.split(" (PID")[0].strip().lower()
+    return name if name.endswith(".exe") else ""
+
+
+def kill_game_pid(pid):
+    """只杀我们自己启动的那个游戏进程，先核对它确实是 QuestAway.exe。
+
+    pid 会被系统复用，直接 taskkill 有可能打到别的程序上，所以必须先验名。
+    """
+    if not pid:
+        return False
+    try:
+        out = subprocess.run(["tasklist", "/FI", "PID eq %d" % int(pid)], capture_output=True,
+                             timeout=8, creationflags=_NO_WIN).stdout.decode("gbk", "ignore")
+    except Exception:
+        return False
+    if "questaway" not in out.lower():
+        return False
+    try:
+        subprocess.run(["taskkill", "/PID", str(int(pid)), "/T", "/F"], capture_output=True,
+                       timeout=10, creationflags=_NO_WIN)
+        return True
+    except Exception:
+        return False
 
 
 def port_owner(port=None):
@@ -138,8 +223,8 @@ def _why_no_port(err):
     if _port_listening():
         who = port_owner() or "未知程序"
         return ("127.0.0.1:%d 有程序在监听，但不是游戏的调试端口：%s\n"
-                "这个端口被别的软件占了，游戏就开不出调试端口。\n"
-                "把占用它的程序关掉，再重新「一键启动游戏」。\n"
+                "这个端口被别的软件占了，游戏就会开不出调试端口。\n"
+                "助手会自动换一个空端口重启游戏，你也可以先把占用它的程序关掉。\n"
                 "（原始错误：%s）" % (PORT, who, err))
     return ("127.0.0.1:%d 上没有任何程序在监听 —— 游戏的调试端口没开。\n"
             "按顺序自查：\n"
