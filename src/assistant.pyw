@@ -93,8 +93,11 @@ CUBE_NEED = 8
 
 AUTHOR_URL = "https://space.bilibili.com/8044987"
 REPO_URL = "https://github.com/YuMioHane/Vka-QuestAwayAssistant"
+APP_VER = "2.1"
+APP_EDITION = "Debug"
+APP_TITLE = f"QuestAway 助手 v{APP_VER} · {APP_EDITION}"
 # 公告内容变了就 +1：老用户即使勾过「以后不再显示」也会再看一次
-NOTICE_VER = 2
+NOTICE_VER = 3
 
 DEFAULT_CFG = {
     "game_exe": "",
@@ -805,7 +808,7 @@ class DebugWindow(tk.Toplevel):
     def __init__(self, app):
         super().__init__(app)
         self.app = app
-        self.title("QuestAway 助手 · 调试信息")
+        self.title(f"QuestAway 助手 v{APP_VER} · 调试信息")
         self.geometry("780x640")
         self.configure(bg="#ffffff")
         self.attributes("-topmost", True)
@@ -963,7 +966,7 @@ class App(tk.Tk):
         super().__init__()
         # 任何界面回调里的异常都记日志 + 弹窗，绝不让它把进程带走
         self.report_callback_exception = self._on_error
-        self.title("QuestAway 助手 · 调试版")
+        self.title(APP_TITLE)
         self.geometry("490x820+820+10")
         self.attributes("-topmost", True)
         self.cfg = load_cfg()
@@ -1009,7 +1012,8 @@ class App(tk.Tk):
         body = ttk.Frame(win, padding=16)
         body.pack(fill="both", expand=True)
 
-        ttk.Label(body, text="QuestAway 助手", font=("Microsoft YaHei UI", 15, "bold")).pack(anchor="w")
+        ttk.Label(body, text=f"QuestAway 助手 v{APP_VER} · {APP_EDITION}",
+                  font=("Microsoft YaHei UI", 15, "bold")).pack(anchor="w")
         ttk.Label(body, text="完全免费 · 已开源（GitHub 公开仓库）",
                   font=("Microsoft YaHei UI", 11, "bold"), foreground="#2f9e44").pack(anchor="w", pady=(6, 10))
         ttk.Label(body, justify="left", wraplength=400,
@@ -1025,6 +1029,12 @@ class App(tk.Tk):
         rlink.bind("<Button-1>", lambda e: open_url(REPO_URL))
         ttk.Label(body, text=REPO_URL, foreground="#8b93a1", wraplength=400,
                   justify="left").pack(anchor="w")
+
+        ttk.Label(body, justify="left", wraplength=400, foreground="#495057",
+                  text="这一版是 Debug 版：多了一个「调试」窗口，能看连接状态、调试端口、\n"
+                       "WebView2 版本和带毫秒时间戳的详细日志。\n"
+                       "连不上时点「刷新连接信息」再点「复制全部」，粘出来就能定位。"
+                  ).pack(anchor="w", pady=(10, 0))
 
         ttk.Label(body, justify="left", wraplength=400, foreground="#8b93a1",
                   text="软件只操作游戏里本来就有的按钮与格子，不改存档、不改协议。\n"
@@ -1067,7 +1077,8 @@ class App(tk.Tk):
 
         head = ttk.Frame(self)
         head.pack(fill="x", **pad)
-        ttk.Label(head, text="QuestAway 助手", font=("Microsoft YaHei UI", 13, "bold")).pack(side="left")
+        ttk.Label(head, text=f"QuestAway 助手 v{APP_VER} · {APP_EDITION}",
+                  font=("Microsoft YaHei UI", 13, "bold")).pack(side="left")
         ttk.Button(head, text="调试", command=self.open_debug).pack(side="right", padx=(6, 0))
         self.lbl = ttk.Label(head, text="未连接", foreground="#8b93a1")
         self.lbl.pack(side="right")

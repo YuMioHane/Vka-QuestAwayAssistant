@@ -6,6 +6,9 @@ QuestAway 的外部挂机助手。**完全免费、开源**，不修改游戏文
 
 作者 B 站主页：<https://space.bilibili.com/8044987>
 
+当前版本：**v2.1 Debug**（带调试窗口）·
+下载：<https://github.com/YuMioHane/Vka-QuestAwayAssistant/releases/latest>
+
 ---
 
 ## 功能
