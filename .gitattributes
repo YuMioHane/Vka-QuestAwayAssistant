@@ -1,0 +1,4 @@
+# bat 必须 CRLF，否则 cmd 解析会错位
+*.bat text eol=crlf
+*.pyw text eol=lf
+*.md text eol=lf
